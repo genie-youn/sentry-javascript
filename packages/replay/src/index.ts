@@ -1,6 +1,6 @@
 /* eslint-disable max-lines */ // TODO: We might want to split this file up
 import { addGlobalEventProcessor, getCurrentHub, Scope, setContext } from '@sentry/core';
-import { Breadcrumb, Client, Event, Integration } from '@sentry/types';
+import { Breadcrumb, Client, DataCategory, Event, EventDropReason, Integration } from '@sentry/types';
 import { addInstrumentationHandler, createEnvelope } from '@sentry/utils';
 import debounce from 'lodash.debounce';
 import { PerformanceObserverEntryList } from 'perf_hooks';
@@ -124,6 +124,11 @@ export class Replay implements Integration {
    * Function to stop recording
    */
   private stopRecording: ReturnType<typeof record> | null = null;
+
+  /**
+   * We overwrite `client.recordDroppedEvent`, but store the original method here so we can restore it.
+   */
+  private _originalRecordDroppedEvent?: Client['recordDroppedEvent'];
 
   private context: InternalEventContext = {
     errorIds: new Set(),
@@ -433,6 +438,8 @@ export class Replay implements Integration {
         // Tag all (non replay) events that get sent to Sentry with the current
         // replay ID so that we can reference them later in the UI
         addGlobalEventProcessor(this.handleGlobalEvent);
+        // We need to filter out dropped events
+        this._overwriteRecordDroppedEvent();
 
         this.hasInitializedCoreListeners = true;
       }
@@ -481,6 +488,8 @@ export class Replay implements Integration {
 
       window.removeEventListener('blur', this.handleWindowBlur);
       window.removeEventListener('focus', this.handleWindowFocus);
+
+      this._restoreRecordDroppedEvent();
 
       if (this.performanceObserver) {
         this.performanceObserver.disconnect();
@@ -1342,5 +1351,40 @@ export class Replay implements Integration {
         }, this.retryInterval);
       });
     }
+  }
+
+  _overwriteRecordDroppedEvent(): void {
+    const client = getCurrentHub().getClient();
+
+    if (!client) {
+      return;
+    }
+
+    const _originalCallback = client.recordDroppedEvent.bind(client);
+
+    const recordDroppedEvent: Client['recordDroppedEvent'] = (
+      reason: EventDropReason,
+      category: DataCategory,
+      event?: Event,
+    ): void => {
+      if (event && event.event_id) {
+        this.context.errorIds.delete(event.event_id);
+      }
+
+      return _originalCallback(reason, category, event);
+    };
+
+    client.recordDroppedEvent = recordDroppedEvent;
+    this._originalRecordDroppedEvent = _originalCallback;
+  }
+
+  _restoreRecordDroppedEvent(): void {
+    const client = getCurrentHub().getClient();
+
+    if (!client || !this._originalRecordDroppedEvent) {
+      return;
+    }
+
+    client.recordDroppedEvent = this._originalRecordDroppedEvent;
   }
 }
